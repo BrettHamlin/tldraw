@@ -139,3 +139,37 @@ Find us on Twitter/X at [@tldraw](https://twitter.com/tldraw).
 ## Community
 
 Have questions, comments or feedback? [Join our discord](https://discord.tldraw.com/?utm_source=github&utm_medium=readme&utm_campaign=sociallink). For the latest news and release notes, visit [tldraw.dev](https://tldraw.dev).
+
+## Local presenter authoring
+
+The dedicated presenter service runs locally without Cloudflare, a hosted widget, model subprocesses, or API keys. From the repo root:
+
+```sh
+pnpm --filter mcp-app dev:presenter
+```
+
+Configure a native MCP client with Streamable HTTP URL `http://127.0.0.1:5481/mcp`. The service binds only `127.0.0.1`; an MCP client disconnect does not stop it. SIGINT/SIGTERM closes transports and the listener. State is in memory and resets on restart; browser library persistence/export remains independent.
+
+Open `http://localhost:5420/presenter-canvas/full` with the examples dev server running. After a draft arrives, choose **Rehearse this deck**, then use the audience **Next** controls to advance beats. Schema metadata and submit receipts include this `presenterUrl`.
+
+Tools:
+
+- `presenter_schema({})`: version 1 document JSON schema, authoring rules, and browser bridge metadata.
+- `presenter_get({})`: `{sourceId, revision, document}`; initially revision 0 and document null.
+- `presenter_submit({expectedSourceId, expectedRevision, document})`: validate and replace the server draft, returning `{sourceId, revision, saved, presenterUrl, browser}`. Read the latest `presenter_get` first and supply its source UUID and revision together, including revision 0 for the first submit. Invalid input and source or revision conflicts preserve the current draft. A conflict returns `isError: true` and `saved: false`.
+- `presenter_preview({document})`: validate and summarize without saving or rendering.
+- `presenter_status({})`: browser self-reports, with `connected` true only while a heartbeat is at most 30 seconds old.
+
+The data schema mirrors the independent example's `document.ts` without importing the examples package. Documents contain version, title, canvas width/height, and beats with unique IDs, titles, notes, and actions. Stroke actions contain timing, color, and ordered `{x,y,pressure}` points; text actions contain timing, text, and coordinates. Bounds match the example: 100 beats, 500 actions per beat, 50000 points per stroke, 200000 positions total, canvas 100–4096 pixels, pressure 0–1, start 0–600000 ms and duration 1–600000 ms. HTTP bodies are limited to 16 MiB. No JavaScript execution or file paths are accepted.
+
+Browser bridge (JSON, no credentials):
+
+- `GET /presenter/draft` returns `{sourceId, revision, document}`. Poll about once per second. A new source ID means the service restarted; revision numbers are scoped to that source.
+- `GET /presenter/status` returns `{sourceId, revision, connected, browsers, browserTtlMs}`.
+- `POST /presenter/ack` takes `{sourceId, revision, browserId, state, rehearsalSourceId, rehearsalRevision, message?}`. Use a stable random browser ID per tab; `state` is `received`, `applied`, or `error`. `rehearsalSourceId` (UUID) and `rehearsalRevision` must both be null when no server-sourced rehearsal is active, or both present to identify the exact source and revision selected for the active rehearsal. Keep that pair while its rehearsal remains active, including across server restarts. `message` is optional, at most 1000 characters. Repeat the acknowledgement as a heartbeat. Response is `{accepted:true, ...status}`. The main `sourceId` and `revision` must match the current server envelope. Stale main source/revision or future rehearsal revisions belonging to the current server source return 409; rehearsal counters from older sources cannot be validated by the restarted server and are accepted. Missing or mismatched rehearsal pairs and other invalid bodies return 400. Up to 16 recent browser clients are retained.
+
+Only `http://localhost:5420` and `http://127.0.0.1:5420` browser Origins are allowed. Browser acknowledgement requires an allowed Origin; native MCP requests must omit Origin. Host must be loopback with the actual listening port. CORS preflight accepts Content-Type and GET/POST/OPTIONS; credentials are neither required nor enabled.
+
+The frontend should run its authoritative `parsePresentation` before replacing the editable draft and acknowledging `applied`; on failure, retain local data and acknowledge `error`. Polling must not replace an active rehearsal. Track the source/revision pair explicitly when choosing a rehearsal and report the pair for the exact active audience rehearsal ID. Identical draft content does not establish rehearsal attribution. Preserve the old pair across a server restart while that rehearsal remains active; use both null for a local or otherwise unattributed rehearsal. A saved server draft, an accepted editable draft, and visible playback are separate facts. Browser status is self-reported and does not verify pixels. Playback stays under the existing local controls; these tools do not start playback. A shareable frontend still works without this local service; remote pages do not receive local bridge access.
+
+Run the real SDK transport and boundary tests with `pnpm --filter mcp-app test run src/presenter/server.test.ts`.
