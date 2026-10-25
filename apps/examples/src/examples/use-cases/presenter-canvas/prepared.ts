@@ -1,5 +1,11 @@
 import { b64Vecs, createShapeId, toRichText } from 'tldraw'
 import type { Editor, TLDefaultColorStyle, TLDrawShape, VecModel } from 'tldraw'
+import {
+	beatDuration,
+	parsePresentation,
+	type PresentationDocument,
+	type PresentationAction,
+} from './document'
 import type { PlaybackScene } from './playback'
 
 interface Stroke {
@@ -44,7 +50,7 @@ function stroke(
 	return { id, points: path(vertices), start, duration, color }
 }
 
-export const preparedBeats: Beat[] = [
+const preparedBeats: Beat[] = [
 	{
 		title: 'Start with a request',
 		note: 'A browser asks a server for a page. Let the request land before explaining the return trip.',
@@ -118,7 +124,7 @@ export const preparedBeats: Beat[] = [
 	},
 	{
 		title: 'Keep a copy nearby',
-		note: 'A cache keeps a reusable copy closer to the browser. This is prepared sample content; AI authoring comes later.',
+		note: 'A cache keeps a reusable copy closer to the browser. A later request can reuse that copy instead of making the full round trip.',
 		duration: 4200,
 		labels: [
 			{ text: 'Cache', x: 370, y: 455 },
@@ -182,45 +188,76 @@ export function strokeProps(stroke: Stroke, progress: number) {
 	} satisfies Partial<TLDrawShape['props']>
 }
 
-export function createPreparedScene(editor: Editor): PlaybackScene {
-	const rendered = new Map<string, string>()
-	const ids = preparedBeats.flatMap((beat, index) => [
-		...beat.strokes.map((stroke) => createShapeId(`presenter-${stroke.id}`)),
-		...beat.labels.map((_, label) => createShapeId(`presenter-label-${index}-${label}`)),
-	])
-	return {
-		durations: preparedBeats.map((beat) => beat.duration),
-		begin(index) {
-			editor.run(
-				() => {
-					for (const [label, { text, x, y }] of preparedBeats[index].labels.entries()) {
-						editor.createShape({
-							id: createShapeId(`presenter-label-${index}-${label}`),
-							type: 'text',
-							x,
-							y,
-							props: {
-								richText: toRichText(text),
-								size: index === 0 && label === 0 ? 'l' : 'm',
-								font: 'draw',
-							},
-						})
-					}
-				},
-				{ history: 'ignore' }
-			)
+export const sampleDocument = parsePresentation({
+	version: 1,
+	title: 'A request takes a round trip',
+	canvas: { width: 900, height: 680 },
+	beats: preparedBeats.map((beat, i) => ({
+		id: `beat-${i}`,
+		title: beat.title,
+		note: beat.note,
+		actions: [
+			...beat.labels.map((label) => ({ kind: 'text', ...label, start: 0, duration: 1 })),
+			...beat.strokes.map((stroke) => ({
+				kind: 'stroke',
+				color: stroke.color,
+				start: stroke.start,
+				duration: stroke.duration,
+				points: stroke.points.map((p) => ({ x: p.x, y: p.y, pressure: (p.z ?? 0.5) / 1.25 })),
+			})),
+		],
+	})),
+})
+
+export function documentStrokeProps(
+	action: Extract<PresentationAction, { kind: 'stroke' }>,
+	progress: number
+) {
+	return strokeProps(
+		{
+			id: '',
+			color: action.color,
+			start: action.start,
+			duration: action.duration,
+			points: action.points.map((p) => ({ x: p.x, y: p.y, z: p.pressure * 1.25 })),
 		},
+		progress
+	)
+}
+
+export function createPreparedScene(
+	editor: Pick<Editor, 'run' | 'getShape' | 'createShape' | 'updateShape' | 'deleteShapes'>,
+	document: PresentationDocument = sampleDocument
+): PlaybackScene {
+	const doc = parsePresentation(document)
+	const rendered = new Map<string, string>()
+	const idFor = (beat: number, action: number) => createShapeId(`presenter-${beat}-${action}`)
+	const ids = doc.beats.flatMap((beat, i) => beat.actions.map((_, j) => idFor(i, j)))
+	return {
+		durations: doc.beats.map(beatDuration),
+		begin() {},
 		render(index, elapsed) {
 			editor.run(
 				() => {
-					for (const stroke of preparedBeats[index].strokes) {
-						if (elapsed < stroke.start) continue
-						const progress = Math.min(1, (elapsed - stroke.start) / stroke.duration)
-						const frame = `${Math.ceil(progress * stroke.points.length)}:${progress >= 1}`
-						if (rendered.get(stroke.id) === frame) continue
-						rendered.set(stroke.id, frame)
-						const id = createShapeId(`presenter-${stroke.id}`)
-						const props = strokeProps(stroke, progress)
+					for (const [j, action] of doc.beats[index].actions.entries()) {
+						if (elapsed < action.start) continue
+						const id = idFor(index, j)
+						if (action.kind === 'text') {
+							if (!editor.getShape(id))
+								editor.createShape({
+									id,
+									type: 'text',
+									x: action.x,
+									y: action.y,
+									props: { richText: toRichText(action.text), font: 'draw', size: 'm' },
+								})
+							continue
+						}
+						const progress = Math.min(1, (elapsed - action.start) / action.duration)
+						const frame = `${Math.ceil(progress * action.points.length)}:${progress >= 1}`
+						if (rendered.get(id) === frame) continue
+						rendered.set(id, frame)
+						const props = documentStrokeProps(action, progress)
 						if (editor.getShape(id)) editor.updateShape<TLDrawShape>({ id, type: 'draw', props })
 						else editor.createShape<TLDrawShape>({ id, type: 'draw', x: 0, y: 0, props })
 					}

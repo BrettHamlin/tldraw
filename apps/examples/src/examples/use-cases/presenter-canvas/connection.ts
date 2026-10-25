@@ -1,5 +1,4 @@
 import type { PlaybackState } from './playback'
-import { preparedBeats } from './prepared'
 
 export const audienceTimeout = 2000
 
@@ -10,7 +9,7 @@ function isState(value: unknown): value is PlaybackState {
 		typeof value.beat === 'number' &&
 		Number.isInteger(value.beat) &&
 		value.beat >= -1 &&
-		value.beat < preparedBeats.length &&
+		value.beat < 100 &&
 		'status' in value &&
 		(value.status === 'ready' ||
 			value.status === 'playing' ||

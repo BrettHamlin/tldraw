@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Editor, Tldraw } from 'tldraw'
 import 'tldraw/tldraw.css'
+import { Authoring } from './Authoring'
 import { PresenterConnection } from './connection'
-import { PreparedPlayback, type PlaybackCommand, type PlaybackState } from './playback'
-import { createPreparedScene, preparedBeats } from './prepared'
+import { beatDuration, type PresentationDocument } from './document'
+import { type PlaybackCommand, type PlaybackState } from './playback'
+import { createPreparedScene, sampleDocument } from './prepared'
+import { AudienceSession, PresenterSession } from './session'
 import './presenter-canvas.css'
 
 const sessionKey = 'presenter-canvas-session'
@@ -25,20 +28,75 @@ function AudienceCanvas() {
 		const opener = window.opener
 		const session = new URLSearchParams(window.location.search).get('session')
 		const publish = (state: PlaybackState) =>
-			opener?.postMessage({ presenterState: state, session }, window.location.origin)
-		const playback = new PreparedPlayback(createPreparedScene(editor), publish)
+			opener?.postMessage(
+				{ presenterState: state, session, rehearsalId: audience.rehearsalId },
+				window.location.origin
+			)
+		const audience = new AudienceSession((document) => {
+			editor.setCameraOptions({
+				isLocked: true,
+				zoomSteps: [1],
+				constraints: {
+					bounds: { x: 0, y: 0, w: document.canvas.width, h: document.canvas.height },
+					behavior: 'contain',
+					initialZoom: 'fit-max',
+					baseZoom: 'fit-max',
+					origin: { x: 0.5, y: 0.5 },
+					padding: { x: 24, y: 24 },
+				},
+			})
+			editor.zoomToBounds(
+				{ x: 0, y: 0, w: document.canvas.width, h: document.canvas.height },
+				{ force: true, inset: 48, immediate: true }
+			)
+			return createPreparedScene(editor, document)
+		}, publish)
+		const hello = () =>
+			opener?.postMessage(
+				{
+					presenterHello: true,
+					session,
+					document: audience.document,
+					rehearsalId: audience.rehearsalId,
+				},
+				window.location.origin
+			)
 		const receive = (event: MessageEvent<unknown>) => {
 			if (event.origin !== window.location.origin || event.source !== opener || !opener) return
-			if (event.data === 'presenter-ping') publish(playback.getState())
-			else if (isCommand(event.data)) playback.command(event.data)
+			if (event.data === 'presenter-ping') {
+				if (audience.playback) publish(audience.playback.getState())
+				else hello()
+			} else if (event.data === 'presenter-document') hello()
+			else if (isCommand(event.data)) audience.playback?.command(event.data)
+			else if (
+				event.data &&
+				typeof event.data === 'object' &&
+				'initialize' in event.data &&
+				'rehearsalId' in event.data &&
+				typeof event.data.rehearsalId === 'string'
+			) {
+				try {
+					audience.initialize(
+						event.data.initialize,
+						event.data.rehearsalId,
+						'replace' in event.data && event.data.replace === true
+					)
+					hello()
+				} catch {
+					/* Ignore invalid messages without changing the active show. */
+				}
+			}
 		}
 		window.addEventListener('message', receive)
-		publish(playback.getState())
-		const heartbeat = setInterval(() => publish(playback.getState()), 500)
+		hello()
+		const heartbeat = setInterval(() => {
+			if (audience.playback) publish(audience.playback.getState())
+			else hello()
+		}, 500)
 		return () => {
 			clearInterval(heartbeat)
 			window.removeEventListener('message', receive)
-			playback.dispose()
+			audience.dispose()
 		}
 	}, [editor])
 
@@ -67,6 +125,8 @@ function AudienceCanvas() {
 }
 
 function Presenter() {
+	const [activeDocument, setActiveDocument] = useState(sampleDocument)
+	const [rehearsal] = useState(() => new PresenterSession(sampleDocument, crypto.randomUUID()))
 	const [connection] = useState(() => {
 		const session = sessionStorage.getItem(sessionKey) ?? crypto.randomUUID()
 		sessionStorage.setItem(sessionKey, session)
@@ -81,21 +141,66 @@ function Presenter() {
 	)
 
 	useEffect(() => {
+		let requestedDocument = false
 		const receive = (event: MessageEvent<unknown>) => {
 			if (!event.source || !('opener' in event.source)) return
+			if (
+				event.origin === window.location.origin &&
+				event.source.opener === window &&
+				(!connection.audience || event.source === connection.audience) &&
+				event.data &&
+				typeof event.data === 'object' &&
+				'presenterHello' in event.data &&
+				'session' in event.data &&
+				event.data.session === connection.session
+			) {
+				const source = event.source
+				try {
+					rehearsal.hello(
+						'document' in event.data ? event.data.document : null,
+						'rehearsalId' in event.data ? event.data.rehearsalId : null,
+						(request) => source.postMessage(request, window.location.origin)
+					)
+					setActiveDocument(rehearsal.document)
+					setState(rehearsal.state)
+				} catch {
+					return
+				}
+				return
+			}
 			const state = connection.receive(
 				{ origin: event.origin, source: event.source, data: event.data },
 				Date.now()
 			)
 			if (!state) return
-			setState(state)
+			rehearsal.setConnected(true)
+			rehearsal.deliver((request) =>
+				connection.audience?.postMessage(request, window.location.origin)
+			)
+			if (
+				rehearsal.receiveState(
+					state,
+					event.data && typeof event.data === 'object' && 'rehearsalId' in event.data
+						? event.data.rehearsalId
+						: null
+				)
+			) {
+				setState(rehearsal.state)
+				setActiveDocument(rehearsal.document)
+			}
 			setConnected(true)
+			if (!requestedDocument && connection.audience) {
+				requestedDocument = true
+				connection.audience.postMessage('presenter-document', window.location.origin)
+			}
 		}
 		const pauseOnExit = () => connection.audience?.postMessage('pause', window.location.origin)
 		window.addEventListener('pagehide', pauseOnExit)
 		window.addEventListener('message', receive)
 		const timer = setInterval(() => {
-			setConnected(connection.isConnected(Date.now()))
+			const connected = connection.isConnected(Date.now())
+			rehearsal.setConnected(connected)
+			setConnected(connected)
 			if (connection.audience?.closed) connection.audience = null
 			else connection.audience?.postMessage('presenter-ping', window.location.origin)
 		}, 500)
@@ -105,7 +210,7 @@ function Presenter() {
 			clearInterval(timer)
 			connection.audience?.postMessage('pause', window.location.origin)
 		}
-	}, [connection])
+	}, [connection, rehearsal])
 
 	useEffect(() => {
 		const keydown = (event: KeyboardEvent) => {
@@ -116,10 +221,14 @@ function Presenter() {
 				(target.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName))
 			)
 				return
+			if (target instanceof HTMLElement && target.closest('.presenter-authoring')) return
 			if (event.code === 'Space' && target instanceof HTMLButtonElement) return
 			if (event.code === 'ArrowRight' || event.code === 'Space') {
 				event.preventDefault()
 				send('next')
+			} else if (event.code === 'KeyR') {
+				event.preventDefault()
+				send('reset')
 			} else if (event.code === 'KeyP') {
 				event.preventDefault()
 				send(state.status === 'paused' ? 'resume' : 'pause')
@@ -140,6 +249,7 @@ function Presenter() {
 		url.searchParams.set('session', session)
 		const opened = window.open(url, '_blank', 'popup,width=1200,height=850')
 		if (opened) {
+			rehearsal.setConnected(false)
 			connection.attach(opened, session)
 			sessionStorage.setItem(sessionKey, session)
 		}
@@ -149,13 +259,13 @@ function Presenter() {
 	}
 
 	const canAdvance = connected && (state.status === 'ready' || state.status === 'waiting')
-	const currentBeat = preparedBeats[state.beat]
-	const nextBeat = preparedBeats[state.beat + 1]
+	const currentBeat = activeDocument.beats[state.beat]
+	const nextBeat = activeDocument.beats[state.beat + 1]
 	return (
 		<div className="tldraw__editor presenter-controller">
 			<main className="presenter-desk">
 				<header>
-					<h1>A request takes a round trip</h1>
+					<h1>{activeDocument.title}</h1>
 					<p>A prepared drawing rehearsal. You narrate; the canvas follows your cues.</p>
 				</header>
 				<section className="presenter-output" aria-label="Audience window">
@@ -222,25 +332,38 @@ function Presenter() {
 						</div>
 						<p className="presenter-keys">
 							In this view: <kbd>Space</kbd> / <kbd>→</kbd> next beat · <kbd>P</kbd> pause or resume
+							· <kbd>R</kbd> reset
 						</p>
 						{nextBeat && <p className="presenter-up-next">Up next: {nextBeat.title}</p>}
 					</section>
 					<nav aria-label="Prepared beats">
 						<ol className="presenter-beats">
-							{preparedBeats.map((beat, index) => (
+							{activeDocument.beats.map((beat, index) => (
 								<li key={beat.title} aria-current={state.beat === index ? 'step' : undefined}>
 									<span>{index + 1}</span>
 									<div>
 										<strong>{beat.title}</strong>
-										<p>{beat.duration / 1000}s of drawing, then hold</p>
+										<p>{beatDuration(beat) / 1000}s of drawing, then hold</p>
 									</div>
 								</li>
 							))}
 						</ol>
 					</nav>
 				</div>
+				<Authoring
+					activeRehearsalId={rehearsal.getCurrentRehearsalId()}
+					onRehearse={(document: PresentationDocument) => {
+						const id = crypto.randomUUID()
+						rehearsal.rehearse(document, id)
+						if (connection.audience && connection.isConnected(Date.now()))
+							rehearsal.deliver((request) =>
+								connection.audience?.postMessage(request, window.location.origin)
+							)
+						return id
+					}}
+				/>
 				<footer>
-					Prepared sample strokes · No AI requests or microphone · Reset, then start to replay
+					Author locally · Share only the audience window · Reset, then start to replay
 				</footer>
 			</main>
 		</div>
